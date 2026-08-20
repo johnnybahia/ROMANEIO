@@ -1,0 +1,25 @@
+{
+  "pasta_notas": "C:/Users/juy/OneDrive/PROJETO ROMANEIO/files/NOTAS",
+  "pasta_saida": "C:\\Marfim\\ROMANEIOS",
+  "empresa": "MARFIM IND TEXTIL DO CEARA LTDA",
+  "titulo": "ROMANEIO DE EXPEDICAO",
+  "impressora": "Argox OS-214TT PPLA",
+  "arquivo_contador": "contador_romaneio.json",
+  "dpi_impressao": 200,
+  "email": {
+    "modo_envio": "thunderbird",
+    "smtp": "",
+    "porta": 587,
+    "seguranca": "starttls",
+    "autenticar": true,
+    "usuario": "",
+    "senha": "",
+    "remetente": "",
+    "destinatarios": [
+      "johnny@marfim-bahia.ind.br"
+    ],
+    "assunto": "Romaneio Marfim Ceará",
+    "corpo": ""
+  },
+  "thunderbird": "C:\\Program Files\\Mozilla Thunderbird\\thunderbird.exe"
+}
