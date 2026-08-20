@@ -1,5 +1,14 @@
 {
-  "pasta_notas": "C:/Users/juy/OneDrive/PROJETO ROMANEIO/files/NOTAS",
+  "pasta_notas": "\\\\10.121.19.8\\C$\\Users\\marfimbh1\\Desktop\\NOTAS",
+  "servidor": {
+    "ativo": true,
+    "host": "10.121.19.8",
+    "compartilhamento": "C$",
+    "pasta_remota": "C:\\Users\\marfimbh1\\Desktop\\NOTAS",
+    "usuario": "marfimbh1",
+    "dominio": "",
+    "usar_credenciais_windows": false
+  },
   "pasta_saida": "C:\\Marfim\\ROMANEIOS",
   "empresa": "MARFIM IND TEXTIL DO CEARA LTDA",
   "titulo": "ROMANEIO DE EXPEDICAO",

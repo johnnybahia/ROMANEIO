@@ -1,0 +1,7 @@
+# Senha do servidor das notas - nunca versionar
+credenciais_rede.json
+
+# Arquivos gerados em uso
+erro_romaneio.log
+__pycache__/
+*.pyc

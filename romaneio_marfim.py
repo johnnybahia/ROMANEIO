@@ -3,7 +3,7 @@
 Romaneio de Expedicao - Marfim
 Le PDFs de DANFE de uma pasta, gera romaneio em PDF, envia por e-mail e imprime.
 """
-import os, re, json, sys, glob, time, subprocess, threading, smtplib, shutil
+import os, re, json, sys, glob, time, base64, subprocess, threading, smtplib, shutil
 from datetime import datetime
 from email.message import EmailMessage
 
@@ -24,10 +24,21 @@ from tkinter import ttk, messagebox, simpledialog, filedialog
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 CACHE_PATH = os.path.join(APP_DIR, "indice_cache.json")
+# Senha do servidor das notas - fica fora do config.json de proposito.
+CRED_PATH = os.path.join(APP_DIR, "credenciais_rede.json")
 
 CONFIG_PADRAO = {
     "pasta_notas": "",
     "pasta_saida": "",
+    "servidor": {
+        "ativo": False,
+        "host": "",
+        "compartilhamento": "C$",
+        "pasta_remota": "",
+        "usuario": "",
+        "dominio": "",
+        "usar_credenciais_windows": False
+    },
     "empresa": "MARFIM IND TEXTIL DO CEARA LTDA",
     "titulo": "ROMANEIO DE EXPEDICAO",
     "impressora": "",
@@ -61,7 +72,330 @@ def carregar_config():
     e = dict(CONFIG_PADRAO["email"])
     e.update(cfg.get("email", {}))
     base["email"] = e
+    s = dict(CONFIG_PADRAO["servidor"])
+    s.update(cfg.get("servidor", {}))
+    base["servidor"] = s
     return base
+
+
+# ----------------------------------------------------------------------------
+# PASTA DAS NOTAS EM SERVIDOR REMOTO
+# ----------------------------------------------------------------------------
+# As DANFEs ficam num servidor da rede (ex.: 10.121.19.8, pasta
+# C:\Users\marfimbh1\Desktop\NOTAS). O programa le direto de la pelo caminho
+# UNC  \\10.121.19.8\C$\Users\marfimbh1\Desktop\NOTAS  autenticando com o
+# usuario e a senha do servidor.
+#
+# A senha NAO fica no config.json. Ela e gravada em credenciais_rede.json,
+# protegida pela conta do Windows (DPAPI) quando o pywin32 esta instalado.
+# Tambem pode vir da variavel de ambiente ROMANEIO_SENHA_REDE.
+
+SENHA_AUSENTE = '__SENHA_AUSENTE__'
+
+ERROS_REDE = {
+    5: 'Acesso negado. O usuario informado nao tem permissao nessa pasta.\n'
+       'O compartilhamento administrativo (C$) so aceita contas que sejam '
+       'administradoras do servidor. Se essa conta nao for administradora, '
+       'compartilhe a pasta NOTAS no servidor (botao direito > Propriedades > '
+       'Compartilhamento) e use o nome do compartilhamento aqui.',
+    51: 'A rede esta fora do ar ou o servidor nao respondeu.',
+    53: 'Servidor nao encontrado na rede. Confira o IP e se o servidor esta ligado.',
+    59: 'Erro de rede inesperado ao falar com o servidor.',
+    64: 'O servidor recusou a conexao (compartilhamento removido ou servico parado).',
+    67: 'Compartilhamento nao encontrado no servidor. Confira o nome apos o IP.',
+    71: 'O servidor atingiu o limite de conexoes simultaneas. Tente de novo em instantes.',
+    86: 'A senha desta conta nao confere no servidor.',
+    1219: 'Ja existe uma conexao aberta com esse servidor usando outro usuario.\n'
+          'Feche as pastas de rede abertas e use Arquivo > Reconectar ao servidor.',
+    1326: 'Usuario ou senha incorretos.',
+    1327: 'Contas sem senha nao podem acessar pastas pela rede.',
+    1331: 'A conta esta desativada no servidor.',
+    1330: 'A senha desta conta expirou no servidor.',
+    1907: 'A senha desta conta precisa ser trocada no servidor.',
+    1909: 'A conta esta bloqueada no servidor.',
+    1460: 'Tempo esgotado esperando o servidor responder.',
+}
+
+
+def normalizar_caminho(texto, windows=False):
+    """Padroniza um caminho: tira aspas e espacos; usa \\ em caminhos do Windows.
+
+    Um caminho de outro sistema (/mnt/notas) e devolvido como esta, para o
+    programa continuar testavel fora do Windows.
+    """
+    p = (texto or '').strip().strip('"')
+    if (windows or os.name == 'nt' or p.startswith('\\\\') or '\\' in p
+            or re.match(r'^[A-Za-z]:[\\/]', p)):
+        p = p.replace('/', '\\')
+    return p if len(p) <= 3 else p.rstrip('\\/')
+
+
+def montar_caminho_rede(srv):
+    """Monta o caminho UNC completo da pasta de notas no servidor.
+
+    Aceita a pasta remota como caminho local do servidor (C:\\Users\\...\\NOTAS),
+    como caminho relativo ao compartilhamento (Users\\...\\NOTAS) ou ja como UNC.
+    """
+    pasta = normalizar_caminho(srv.get('pasta_remota'), windows=True)
+    if pasta.startswith('\\\\'):
+        return pasta
+    host = normalizar_caminho(srv.get('host'), windows=True).lstrip('\\')
+    if not host:
+        return ''
+    share = normalizar_caminho(srv.get('compartilhamento'), windows=True).strip('\\')
+    letra = re.match(r'^([A-Za-z]):\\?(.*)$', pasta)
+    if letra:
+        share = f'{letra.group(1).upper()}$'
+        pasta = letra.group(2)
+    resto = pasta.strip('\\')
+    return '\\\\' + host + '\\' + (share or 'C$') + (('\\' + resto) if resto else '')
+
+
+def raiz_compartilhamento(unc):
+    """Devolve \\\\servidor\\compartilhamento de um caminho UNC."""
+    partes = [p for p in normalizar_caminho(unc, windows=True).split('\\') if p]
+    if len(partes) < 2:
+        return ''
+    return '\\\\' + partes[0] + '\\' + partes[1]
+
+
+def host_do_caminho(unc):
+    partes = [p for p in normalizar_caminho(unc, windows=True).split('\\') if p]
+    return partes[0] if partes else ''
+
+
+def usuario_rede(srv, host=''):
+    """Monta o login como o Windows espera: SERVIDOR\\usuario."""
+    usuario = (srv.get('usuario') or '').strip()
+    if not usuario or '\\' in usuario or '@' in usuario:
+        return usuario
+    dominio = (srv.get('dominio') or '').strip() or host or \
+        normalizar_caminho(srv.get('host')).lstrip('\\')
+    return f'{dominio}\\{usuario}' if dominio else usuario
+
+
+# ------------------------------------------------------- senha do servidor
+def _chave_credencial(host, usuario):
+    return f"{(host or '').strip().lower()}|{(usuario or '').strip().lower()}"
+
+
+def _proteger(texto):
+    """Cifra a senha com a conta do Windows (DPAPI). Sem pywin32, so codifica."""
+    try:
+        import win32crypt
+        dados = win32crypt.CryptProtectData(texto.encode('utf-8'), 'romaneio',
+                                            None, None, None, 0)
+        return 'dpapi:' + base64.b64encode(dados).decode('ascii')
+    except Exception:
+        return 'b64:' + base64.b64encode(texto.encode('utf-8')).decode('ascii')
+
+
+def _desproteger(valor):
+    if not valor:
+        return ''
+    if valor.startswith('dpapi:'):
+        try:
+            import win32crypt
+            _rot, dados = win32crypt.CryptUnprotectData(
+                base64.b64decode(valor[6:]), None, None, None, 0)
+            return dados.decode('utf-8')
+        except Exception:
+            return ''
+    if valor.startswith('b64:'):
+        try:
+            return base64.b64decode(valor[4:]).decode('utf-8')
+        except Exception:
+            return ''
+    return valor
+
+
+def ler_credenciais():
+    if not os.path.exists(CRED_PATH):
+        return {}
+    try:
+        with open(CRED_PATH, encoding='utf-8') as f:
+            dados = json.load(f)
+        return dados if isinstance(dados, dict) else {}
+    except Exception:
+        return {}
+
+
+def salvar_senha_rede(host, usuario, senha):
+    """Guarda (ou apaga) a senha do servidor no arquivo local de credenciais."""
+    host = normalizar_caminho(host).lstrip('\\')
+    dados = ler_credenciais()
+    chave = _chave_credencial(host, usuario)
+    if senha:
+        dados[chave] = _proteger(senha)
+    elif chave in dados:
+        dados.pop(chave)
+    else:
+        return True
+    try:
+        with open(CRED_PATH, 'w', encoding='utf-8') as f:
+            json.dump(dados, f, indent=2)
+        if os.name != 'nt':
+            os.chmod(CRED_PATH, 0o600)
+        return True
+    except Exception:
+        return False
+
+
+def senha_rede(srv):
+    """Procura a senha: variavel de ambiente, arquivo local, config.json."""
+    env = os.environ.get('ROMANEIO_SENHA_REDE')
+    if env:
+        return env
+    host = normalizar_caminho(srv.get('host')).lstrip('\\')
+    guardada = ler_credenciais().get(_chave_credencial(host, srv.get('usuario')))
+    if guardada:
+        return _desproteger(guardada)
+    return srv.get('senha') or ''
+
+
+def migrar_senha_config(cfg):
+    """Tira a senha do config.json e passa para o arquivo de credenciais.
+
+    O config.json vai junto com o programa (e pode ir para o repositorio),
+    entao senha nenhuma deve ficar guardada nele.
+    """
+    srv = cfg.get('servidor') or {}
+    senha = srv.pop('senha', '')
+    if not senha:
+        return False
+    salvar_senha_rede(srv.get('host'), srv.get('usuario'), senha)
+    try:
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+    return True
+
+
+# ------------------------------------------------------------ conexao SMB
+def _texto_processo(dados):
+    for cp in ('cp850', 'cp1252', 'utf-8'):
+        try:
+            return dados.decode(cp)
+        except Exception:
+            continue
+    return dados.decode('utf-8', errors='replace')
+
+
+def _rodar_oculto(cmd, timeout=40):
+    """Roda um comando sem abrir janela preta. Devolve (codigo, saida)."""
+    extras = {}
+    if os.name == 'nt':
+        extras['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=timeout, **extras)
+    except subprocess.TimeoutExpired:
+        return 1460, ''
+    except Exception as ex:
+        return 1, str(ex)
+    return p.returncode, _texto_processo(p.stdout or b'').strip()
+
+
+def _desconectar_rede(raiz):
+    """Derruba a conexao atual com o compartilhamento, se houver."""
+    try:
+        import win32wnet
+        win32wnet.WNetCancelConnection2(raiz, 0, True)
+        return
+    except Exception:
+        pass
+    _rodar_oculto(['net', 'use', raiz, '/delete', '/y'], timeout=25)
+
+
+def _abrir_conexao(raiz, usuario, senha):
+    """Autentica no compartilhamento. Devolve (codigo do Windows, texto)."""
+    try:
+        import win32wnet
+        import win32netcon
+    except ImportError:
+        win32wnet = None
+    if win32wnet is not None:
+        recurso = win32wnet.NETRESOURCE()
+        recurso.dwType = win32netcon.RESOURCETYPE_DISK
+        recurso.lpRemoteName = raiz
+        try:
+            win32wnet.WNetAddConnection2(recurso, senha or None, usuario or None, 0)
+            return 0, ''
+        except Exception as ex:
+            cod = ex.args[0] if ex.args and isinstance(ex.args[0], int) else 1
+            texto = ex.args[2] if len(ex.args) > 2 else str(ex)
+            return cod, str(texto)
+    cmd = ['net', 'use', raiz]
+    if senha:
+        cmd.append(senha)
+    if usuario:
+        cmd.append('/user:' + usuario)
+    cmd.append('/persistent:no')
+    cod, saida = _rodar_oculto(cmd)
+    if cod:
+        # "Erro do sistema 5 ocorreu." / "System error 1326 has occurred."
+        m = re.search(r'err(?:o|or)[^\d]{0,30}(\d{1,5})', saida, re.I)
+        if m:
+            cod = int(m.group(1))
+    return cod, saida
+
+
+def mensagem_erro_rede(cod, texto, raiz, usuario):
+    detalhe = ERROS_REDE.get(cod) or (texto or '').strip() or f'Erro {cod}.'
+    return (f'Nao foi possivel acessar {raiz}'
+            + (f' como {usuario}' if usuario else '')
+            + f'.\n\n{detalhe}'
+            + (f'\n\n(codigo {cod})' if cod else ''))
+
+
+def conectar_rede(caminho, srv, log=None, reconectar=False):
+    """Garante acesso a uma pasta de rede. Devolve (caminho, erro).
+
+    erro None = pasta pronta para uso. erro SENHA_AUSENTE = falta a senha.
+    """
+    caminho = normalizar_caminho(caminho, windows=True)
+    raiz = raiz_compartilhamento(caminho)
+    if not raiz:
+        return caminho, f'Caminho de rede invalido: {caminho}'
+    if not reconectar and os.path.isdir(caminho):
+        return caminho, None
+    if os.name != 'nt':
+        return caminho, (f'Sem acesso a {caminho}. Pastas compartilhadas do '
+                         'Windows so podem ser montadas pelo proprio Windows.')
+    usa_windows = bool(srv.get('usar_credenciais_windows'))
+    usuario = '' if usa_windows else usuario_rede(srv, host_do_caminho(caminho))
+    senha = '' if usa_windows else senha_rede(srv)
+    if usuario and not senha:
+        return caminho, SENHA_AUSENTE
+    if reconectar:
+        _desconectar_rede(raiz)
+    if log:
+        log(f'Conectando em {raiz}...')
+    cod, texto = _abrir_conexao(raiz, usuario, senha)
+    if cod == 1219:
+        _desconectar_rede(raiz)
+        cod, texto = _abrir_conexao(raiz, usuario, senha)
+    if os.path.isdir(caminho):
+        return caminho, None
+    if cod:
+        return caminho, mensagem_erro_rede(cod, texto, raiz, usuario)
+    return caminho, (f'O servidor respondeu, mas a pasta nao existe:\n{caminho}\n\n'
+                     'Confira o caminho dentro do servidor.')
+
+
+def preparar_pasta_notas(cfg, pasta='', log=None, reconectar=False):
+    """Resolve a pasta das notas (local ou no servidor) e garante o acesso."""
+    srv = dict(cfg.get('servidor') or {})
+    pasta = normalizar_caminho(pasta) or normalizar_caminho(cfg.get('pasta_notas'))
+    if srv.get('ativo') and not pasta:
+        pasta = montar_caminho_rede(srv)
+    if not pasta.startswith('\\\\'):
+        return pasta, None
+    if not srv.get('ativo') or host_do_caminho(pasta).lower() != \
+            normalizar_caminho(srv.get('host')).lstrip('\\').lower():
+        srv = {'usar_credenciais_windows': True}
+    return conectar_rede(pasta, srv, log=log, reconectar=reconectar)
 
 
 # ----------------------------------------------------------------------------
@@ -317,7 +651,11 @@ def varrer_pasta(pasta, log=None):
     arquivos = sorted(glob.glob(os.path.join(pasta, '*.pdf')) +
                       glob.glob(os.path.join(pasta, '*.PDF')))
     for caminho in arquivos:
-        st = os.stat(caminho)
+        try:
+            st = os.stat(caminho)
+        except OSError:
+            # Arquivo sumiu ou a rede oscilou no meio da varredura.
+            continue
         assinatura = f"{PARSER_VERSAO}:{st.st_mtime_ns}:{st.st_size}"
         chave_cache = os.path.abspath(caminho)
         item = cache.get(chave_cache)
@@ -1028,7 +1366,9 @@ class JanelaRevisao(tk.Toplevel):
                               'No Gmail use senha de app de 16 digitos.', parent=self))
                 self.pai.after(0, lambda: self.bt_env.configure(state='normal'))
             except Exception as ex:
-                self.pai.after(0, lambda: messagebox.showerror('E-mail', str(ex), parent=self))
+                # ex some ao sair do except: guardar no proprio lambda.
+                self.pai.after(0, lambda ex=ex: messagebox.showerror(
+                    'E-mail', str(ex), parent=self))
                 self.pai.after(0, lambda: self.bt_env.configure(state='normal'))
 
         threading.Thread(target=tarefa, daemon=True).start()
@@ -1066,6 +1406,7 @@ class JanelaConfig(tk.Toplevel):
         nb.pack(fill='both', expand=True, padx=8, pady=8)
         self._aba_conta(nb)
         self._aba_destinatarios(nb)
+        self._aba_servidor(nb)
         self._aba_impressao(nb)
 
     # ---------------------------------------------------------------- abas
@@ -1228,6 +1569,141 @@ class JanelaConfig(tk.Toplevel):
         ttk.Label(f, text='Se mais de um PC usar o programa, aponte para uma pasta de rede.',
                   foreground='#8a5a00', wraplength=430).grid(row=6, column=1, columnspan=2,
                                                              sticky='w', pady=(2, 0))
+        if (self.cfg.get('servidor') or {}).get('ativo'):
+            ttk.Label(f, text='A pasta das notas esta sendo preenchida pela aba '
+                              '"Servidor das notas".',
+                      foreground='#205080', wraplength=430).grid(
+                row=7, column=1, columnspan=2, sticky='w', pady=(10, 0))
+
+    def _aba_servidor(self, nb):
+        f = ttk.Frame(nb, padding=10)
+        nb.add(f, text='Servidor das notas')
+        s = self.cfg.get('servidor') or {}
+
+        ttk.Label(f, text='De onde o programa le os PDFs das notas fiscais',
+                  font=('Segoe UI', 9, 'bold')).grid(row=0, column=0, columnspan=3,
+                                                     sticky='w', pady=(0, 6))
+        self.var_srv_ativo = tk.BooleanVar(value=bool(s.get('ativo')))
+        ttk.Checkbutton(f, text='Ler as notas de um servidor da rede',
+                        variable=self.var_srv_ativo,
+                        command=self._alternar_servidor).grid(
+            row=1, column=0, columnspan=3, sticky='w', pady=(0, 6))
+
+        self.campos_srv = []
+        self.var_srv = {}
+        linha = 2
+        for rot, chave, larg in [('Servidor (IP ou nome):', 'host', 26),
+                                 ('Pasta no servidor:', 'pasta_remota', 42),
+                                 ('Compartilhamento:', 'compartilhamento', 12),
+                                 ('Usuario:', 'usuario', 26),
+                                 ('Dominio (opcional):', 'dominio', 26)]:
+            lb = ttk.Label(f, text=rot)
+            lb.grid(row=linha, column=0, sticky='w', pady=3)
+            var = tk.StringVar(value=str(s.get(chave, '')))
+            en = ttk.Entry(f, textvariable=var, width=larg)
+            en.grid(row=linha, column=1, columnspan=2, sticky='w', pady=3)
+            var.trace_add('write', lambda *a: self._mostrar_caminho_rede())
+            self.var_srv[chave] = var
+            self.campos_srv += [lb, en]
+            linha += 1
+
+        lb = ttk.Label(f, text='Senha:')
+        lb.grid(row=linha, column=0, sticky='w', pady=3)
+        self.var_srv_senha = tk.StringVar(value=senha_rede(s))
+        en = ttk.Entry(f, textvariable=self.var_srv_senha, width=26, show='*')
+        en.grid(row=linha, column=1, sticky='w', pady=3)
+        bt = ttk.Button(f, text='Esquecer', width=10, command=self.esquecer_senha_rede)
+        bt.grid(row=linha, column=2, sticky='w', padx=4)
+        self.campos_srv += [lb, en, bt]
+        linha += 1
+
+        self.var_srv_win = tk.BooleanVar(value=bool(s.get('usar_credenciais_windows')))
+        ck = ttk.Checkbutton(f, text='Entrar com o usuario do Windows deste PC '
+                                     '(nao usar o usuario e a senha acima)',
+                             variable=self.var_srv_win)
+        ck.grid(row=linha, column=0, columnspan=3, sticky='w', pady=3)
+        self.campos_srv.append(ck)
+        linha += 1
+
+        self.var_srv_caminho = tk.StringVar()
+        ttk.Label(f, textvariable=self.var_srv_caminho, foreground='#205080',
+                  wraplength=470).grid(row=linha, column=0, columnspan=3,
+                                       sticky='w', pady=(8, 2))
+        linha += 1
+        bt = ttk.Button(f, text='Testar conexao', command=self.testar_servidor)
+        bt.grid(row=linha, column=0, sticky='w', pady=6)
+        self.campos_srv.append(bt)
+        linha += 1
+
+        ttk.Label(f, text='A senha fica gravada so neste computador, no arquivo '
+                          'credenciais_rede.json, cifrada pela conta do Windows '
+                          '(quando o pywin32 esta instalado). '
+                          'Ela nunca e escrita no config.json.\n\n'
+                          'A pasta pode ser informada como o servidor a enxerga '
+                          '(C:\\Users\\fulano\\Desktop\\NOTAS): o programa converte '
+                          'para \\\\servidor\\C$\\Users\\fulano\\Desktop\\NOTAS.\n'
+                          'O compartilhamento C$ so aceita conta administradora do '
+                          'servidor. Se a conta nao for administradora, compartilhe a '
+                          'pasta NOTAS no servidor, escreva o nome do compartilhamento '
+                          'no campo Compartilhamento e deixe a pasta em branco.',
+                  foreground='#8a5a00', wraplength=470,
+                  justify='left').grid(row=linha, column=0, columnspan=3, sticky='w')
+        self._mostrar_caminho_rede()
+        self._alternar_servidor()
+
+    def _alternar_servidor(self):
+        estado = 'normal' if self.var_srv_ativo.get() else 'disabled'
+        for w in getattr(self, 'campos_srv', []):
+            try:
+                w.configure(state=estado)
+            except Exception:
+                pass
+
+    def _mostrar_caminho_rede(self):
+        alvo = montar_caminho_rede({k: v.get() for k, v in self.var_srv.items()})
+        self.var_srv_caminho.set(f'Pasta que sera lida:   {alvo}' if alvo else
+                                 'Preencha o servidor e a pasta.')
+
+    def _coletar_servidor(self):
+        s = dict(self.cfg.get('servidor') or {})
+        s.update({k: v.get().strip() for k, v in self.var_srv.items()})
+        s['ativo'] = bool(self.var_srv_ativo.get())
+        s['usar_credenciais_windows'] = bool(self.var_srv_win.get())
+        s.pop('senha', None)
+        return s
+
+    def esquecer_senha_rede(self):
+        salvar_senha_rede(self.var_srv['host'].get(), self.var_srv['usuario'].get(), '')
+        self.var_srv_senha.set('')
+        messagebox.showinfo('Servidor das notas',
+                            'Senha apagada deste computador.', parent=self)
+
+    def testar_servidor(self):
+        srv = self._coletar_servidor()
+        alvo = montar_caminho_rede(srv)
+        if not alvo:
+            messagebox.showwarning('Servidor das notas',
+                                   'Informe o servidor e a pasta.', parent=self)
+            return
+        salvar_senha_rede(srv.get('host'), srv.get('usuario'), self.var_srv_senha.get())
+        self.config(cursor='watch')
+        self.update_idletasks()
+        erro = None
+        try:
+            _destino, erro = conectar_rede(alvo, srv, reconectar=True)
+        except Exception as ex:
+            erro = str(ex)
+        finally:
+            self.config(cursor='')
+        if erro == SENHA_AUSENTE:
+            erro = 'Informe a senha do usuario do servidor.'
+        if erro:
+            messagebox.showerror('Servidor das notas', erro, parent=self)
+            return
+        pdfs = glob.glob(os.path.join(alvo, '*.pdf')) + glob.glob(os.path.join(alvo, '*.PDF'))
+        messagebox.showinfo('Servidor das notas',
+                            f'Conexao OK.\n\n{alvo}\n\n{len(pdfs)} PDF(s) na pasta.',
+                            parent=self)
 
     # ------------------------------------------------------------- apoio
     def _pasta(self, var):
@@ -1266,6 +1742,9 @@ class JanelaConfig(tk.Toplevel):
         c = self.cfg
         c['impressora'] = self.var_impressora.get().strip()
         c['pasta_notas'] = self.var_pasta_notas.get().strip()
+        c['servidor'] = srv = self._coletar_servidor()
+        if srv.get('ativo'):
+            c['pasta_notas'] = montar_caminho_rede(srv) or c['pasta_notas']
         c['pasta_saida'] = self.var_pasta_saida.get().strip()
         c['arquivo_contador'] = self.var_contador.get().strip() or 'contador_romaneio.json'
         c['thunderbird'] = self.var_tb.get().strip()
@@ -1341,6 +1820,13 @@ class JanelaConfig(tk.Toplevel):
 
     def salvar(self):
         cfg = self._coletar()
+        srv = cfg.get('servidor') or {}
+        if not salvar_senha_rede(srv.get('host'), srv.get('usuario'),
+                                 self.var_srv_senha.get()):
+            messagebox.showwarning('Servidor das notas',
+                                   'Nao consegui gravar a senha em '
+                                   f'{CRED_PATH}.\nEla sera pedida na proxima leitura.',
+                                   parent=self)
         try:
             with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
                 json.dump(cfg, f, indent=2, ensure_ascii=False)
@@ -1360,6 +1846,7 @@ class App(tk.Tk):
         self.geometry(f'1150x{min(680, self.winfo_screenheight() - 80)}')
         self.minsize(900, 420)
         self.cfg = carregar_config()
+        migrar_senha_config(self.cfg)
         self.notas = []
         self.marcadas = set()
         self.ultimo_romaneio = None
@@ -1369,7 +1856,7 @@ class App(tk.Tk):
         self.img_on = self._icone(True)
         self._montar()
         self.after(150, self.atualizar_aviso_impressao)
-        if self.cfg.get('pasta_notas'):
+        if self.pasta_configurada():
             self.after(300, self.atualizar)
 
     @staticmethod
@@ -1393,7 +1880,7 @@ class App(tk.Tk):
         topo = ttk.Frame(self, padding=6)
         topo.pack(fill='x')
         ttk.Label(topo, text='Pasta das notas:').pack(side='left')
-        self.var_pasta = tk.StringVar(value=self.cfg.get('pasta_notas', ''))
+        self.var_pasta = tk.StringVar(value=self.pasta_configurada())
         ttk.Entry(topo, textvariable=self.var_pasta, width=70).pack(side='left', padx=4)
         ttk.Button(topo, text='...', width=3, command=self.escolher_pasta).pack(side='left')
         ttk.Button(topo, text='Atualizar lista', command=self.atualizar).pack(side='left', padx=6)
@@ -1474,6 +1961,8 @@ class App(tk.Tk):
         menu = tk.Menu(self)
         m_arq = tk.Menu(menu, tearoff=0)
         m_arq.add_command(label='Configuracoes...', command=self.abrir_config)
+        m_arq.add_command(label='Reconectar ao servidor',
+                          command=lambda: self.atualizar(reconectar=True))
         m_arq.add_separator()
         m_arq.add_command(label='Sair', command=self.destroy)
         menu.add_cascade(label='Arquivo', menu=m_arq)
@@ -1529,24 +2018,91 @@ class App(tk.Tk):
 
     def escolher_pasta(self):
         p = filedialog.askdirectory()
-        if p:
-            self.var_pasta.set(p)
-
-    def atualizar(self):
-        pasta = self.var_pasta.get().strip()
-        if not os.path.isdir(pasta):
-            messagebox.showwarning('Pasta', 'Pasta invalida.')
+        if not p:
             return
-        self.cfg['pasta_notas'] = pasta
-        self.salvar_config()
-        self.var_status.set('Lendo notas...')
+        p = normalizar_caminho(p)
+        srv = self.cfg.setdefault('servidor', {})
+        if srv.get('ativo') and not p.startswith('\\\\'):
+            if not messagebox.askyesno(
+                    'Servidor das notas',
+                    f"As notas estao sendo lidas do servidor {srv.get('host')}.\n\n"
+                    f'Passar a ler desta pasta do computador?\n{p}'):
+                return
+            srv['ativo'] = False
+            self.salvar_config()
+        self.var_pasta.set(p)
+
+    def pasta_configurada(self):
+        """Pasta das notas em uso: a do servidor quando ele esta ligado."""
+        srv = self.cfg.get('servidor') or {}
+        if srv.get('ativo'):
+            return montar_caminho_rede(srv) or (self.cfg.get('pasta_notas') or '')
+        return self.cfg.get('pasta_notas') or ''
+
+    def pedir_senha_servidor(self, pasta):
+        """Pede a senha do servidor uma unica vez e guarda no computador."""
+        srv = self.cfg.get('servidor') or {}
+        if (not srv.get('ativo') or srv.get('usar_credenciais_windows')
+                or not srv.get('usuario')):
+            return True
+        host = normalizar_caminho(srv.get('host')).lstrip('\\')
+        if not host or host_do_caminho(pasta).lower() != host.lower():
+            return True
+        if senha_rede(srv):
+            return True
+        s = simpledialog.askstring(
+            'Servidor das notas',
+            f"Senha de {srv.get('usuario')} em {host}:", show='*', parent=self)
+        if not s:
+            self.var_status.set('Senha do servidor nao informada.')
+            return False
+        if not salvar_senha_rede(host, srv.get('usuario'), s):
+            messagebox.showwarning('Servidor das notas',
+                                   'Nao consegui guardar a senha neste computador. '
+                                   'Ela sera pedida de novo na proxima vez.')
+        return True
+
+    def atualizar(self, reconectar=False):
+        pasta = self.var_pasta.get().strip() or self.pasta_configurada()
+        if not pasta:
+            messagebox.showwarning('Pasta', 'Informe a pasta das notas em '
+                                            'Configuracoes > Servidor das notas.')
+            return
+        self.var_pasta.set(pasta)
+        na_rede = pasta.startswith('\\\\')
+        if na_rede and not self.pedir_senha_servidor(pasta):
+            return
+        self.var_status.set('Conectando ao servidor...' if na_rede else 'Lendo notas...')
         self.update_idletasks()
+
+        def aviso(titulo, texto, status):
+            self.after(0, lambda: self.var_status.set(status))
+            self.after(0, lambda: messagebox.showwarning(titulo, texto))
 
         def tarefa():
             try:
-                dados = varrer_pasta(pasta, log=lambda m: self.var_status.set(m))
-            except Exception as e:
-                self.after(0, lambda: messagebox.showerror('Erro', str(e)))
+                destino, erro = preparar_pasta_notas(
+                    self.cfg, pasta, log=lambda m: self.var_status.set(m),
+                    reconectar=reconectar)
+            except Exception as ex:
+                destino, erro = pasta, str(ex)
+            if erro == SENHA_AUSENTE:
+                erro = ('Falta a senha do servidor.\n\n'
+                        'Preencha em Configuracoes > Servidor das notas.')
+            if erro:
+                aviso('Servidor das notas', erro, 'Sem acesso a pasta das notas.')
+                return
+            if not os.path.isdir(destino):
+                aviso('Pasta', f'Pasta invalida ou fora do ar:\n{destino}',
+                      'Pasta das notas indisponivel.')
+                return
+            self.cfg['pasta_notas'] = destino
+            self.after(0, lambda: self.var_pasta.set(destino))
+            self.after(0, self.salvar_config)
+            try:
+                dados = varrer_pasta(destino, log=lambda m: self.var_status.set(m))
+            except Exception as ex:
+                aviso('Erro', str(ex), 'Falha ao ler as notas.')
                 return
             self.notas = dados
             self.marcadas.clear()
