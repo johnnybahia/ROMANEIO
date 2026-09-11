@@ -69,7 +69,8 @@ def carregar_config():
 # ----------------------------------------------------------------------------
 LINHAS = {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
 # Alterar esta versão força o cache a reler as DANFEs após mudanças no parser.
-PARSER_VERSAO = "2026-08-20-v2"
+PARSER_VERSAO = "2026-09-11-v3"
+SPLIT_DIR = os.path.join(APP_DIR, "notas_separadas")
 
 
 def _somar_produtos_do_texto(texto):
@@ -181,18 +182,27 @@ def _campo(page, palavras, seq, x1=None, dy=12):
     return re.sub(r'\s+', ' ', txt).strip()
 
 
-def _grade_produtos(page):
-    """Localiza a grade de itens pelas linhas verticais abaixo do cabecalho."""
+def _colunas_produtos(page):
+    """Acha os limites X das colunas da grade de produtos pelo cabecalho NCM/SH."""
     palavras = page.extract_words()
     ncm = [w for w in palavras if w['text'] == 'NCM/SH']
     if not ncm:
-        return []
+        return None
     cab = ncm[0]
+    xs = sorted({round(l['x0'], 1) for l in page.lines
+                if abs(l['x1'] - l['x0']) < 0.5 and l['top'] >= cab['bottom'] - 2})
+    return xs if len(xs) >= 2 else None
+
+
+def _segmento_grade(page, colunas_x):
+    """Bloco de linhas verticais que bate com as colunas conhecidas. Funciona mesmo
+    sem o cabecalho NCM/SH, como nas paginas de continuacao de uma DANFE."""
     verticais = sorted([l for l in page.lines
-                        if abs(l['x1'] - l['x0']) < 0.5 and l['top'] >= cab['bottom'] - 2],
+                        if abs(l['x1'] - l['x0']) < 0.5
+                        and any(abs(l['x0'] - x) < 1.0 for x in colunas_x)],
                        key=lambda l: l['top'])
     if not verticais:
-        return []
+        return None
     topo = verticais[0]['top']
     base = verticais[0]['bottom']
     for l in verticais:
@@ -200,22 +210,110 @@ def _grade_produtos(page):
             base = max(base, l['bottom'])
         else:
             break
-    seg = [l for l in verticais if l['top'] <= base + 1.5]
-    x0 = min(l['x0'] for l in seg)
-    x1 = max(l['x0'] for l in seg)
-    return page.crop((x0 - 0.5, topo - 0.5, x1 + 0.5, base + 0.5)).extract_table(LINHAS) or []
+    return topo, base
 
 
-def ler_danfe(caminho):
-    d = {'arquivo': os.path.basename(caminho), 'caminho': caminho, 'itens': [],
-         'volumes': None, 'peso_bruto': None, 'tot_prod': None, 'qtd_total': None,
-         'nota': None, 'serie': None, 'chave': None, 'cliente': None,
-         'cnpj': None, 'emissao': None, 'transportadora': None, 'paginas': 0,
+def _linhas_produtos(page, colunas_x):
+    """Reconstroi as linhas da grade de produtos pela posicao das palavras, em vez
+    de depender de extract_table() com bordas fechadas. Assim um item nao some
+    quando sua linha e cortada pela quebra de pagina (a ultima linha de uma pagina
+    pode ficar sem a borda inferior desenhada) - o codigo e os valores numericos
+    ficam sempre na primeira linha fisica do item, entao sao lidos na pagina onde
+    o item comeca; so a descricao pode continuar na pagina seguinte.
+    """
+    seg = _segmento_grade(page, colunas_x)
+    if not seg:
+        return []
+    topo, base = seg
+    cols = sorted(colunas_x)
+    palavras = [w for w in page.extract_words()
+               if topo - 0.5 <= w['top'] <= base + 0.5]
+    if not palavras:
+        return []
+    grupos = []
+    for w in sorted(palavras, key=lambda w: w['top']):
+        if grupos and abs(w['top'] - grupos[-1][0]) < 3:
+            grupos[-1][1].append(w)
+        else:
+            grupos.append([w['top'], [w]])
+    resultado = []
+    for _, ws in grupos:
+        celulas = ['' for _ in range(len(cols) - 1)]
+        for w in sorted(ws, key=lambda w: w['x0']):
+            idx = next((i for i in range(len(cols) - 1)
+                       if cols[i] - 1 <= w['x0'] < cols[i + 1] - 1), None)
+            if idx is not None:
+                celulas[idx] = (celulas[idx] + ' ' + w['text']).strip()
+        resultado.append(celulas)
+    return resultado
+
+
+_RX_CHAVE = re.compile(r'CHAVE DE ACESSO\s*\n([\d ]{50,})')
+_RX_NOTA = re.compile(r'N[ºo]\s*(\d{3}\.\d{3}\.\d{3})')
+_RX_SERIE = re.compile(r'SÉRIE:\s*(\d+)')
+
+
+def _identidade_pagina(texto):
+    """Chave de acesso (ou nota+serie, se a chave nao for lida) - usada pra separar
+    as NFs quando um PDF traz varias DANFEs agrupadas."""
+    m = _RX_CHAVE.search(texto)
+    if m:
+        return re.sub(r'\D', '', m.group(1))
+    m_nota = _RX_NOTA.search(texto)
+    if m_nota:
+        m_serie = _RX_SERIE.search(texto)
+        return f"{m_nota.group(1)}/{m_serie.group(1) if m_serie else '?'}"
+    return None
+
+
+def _agrupar_paginas(pdf):
+    """Agrupa paginas consecutivas da mesma NF (uma DANFE pode ter varias paginas,
+    e o PDF pode trazer varias DANFEs uma atras da outra)."""
+    grupos = []
+    atual_id = object()
+    for i, page in enumerate(pdf.pages):
+        ident = _identidade_pagina(page.extract_text() or '')
+        if ident is None:
+            if not grupos:
+                grupos.append([])
+            grupos[-1].append(i)
+            continue
+        if grupos and ident == atual_id:
+            grupos[-1].append(i)
+        else:
+            grupos.append([i])
+            atual_id = ident
+    return grupos
+
+
+def _fatiar_pdf(caminho_origem, indices_paginas, caminho_destino):
+    import pypdfium2 as pdfium
+    origem = pdfium.PdfDocument(caminho_origem)
+    try:
+        novo = pdfium.PdfDocument.new()
+        novo.import_pages(origem, pages=list(indices_paginas))
+        os.makedirs(os.path.dirname(caminho_destino), exist_ok=True)
+        novo.save(caminho_destino)
+        novo.close()
+    finally:
+        origem.close()
+
+
+def _ler_nota(pdf, indices_paginas, caminho):
+    d = {'arquivo': os.path.basename(caminho), 'caminho': caminho,
+         'arquivo_original': caminho, 'paginas_arquivo': list(indices_paginas),
+         'itens': [], 'volumes': None, 'peso_bruto': None, 'tot_prod': None,
+         'qtd_total': None, 'nota': None, 'serie': None, 'chave': None,
+         'cliente': None, 'cnpj': None, 'emissao': None, 'transportadora': None,
+         'paginas': len(indices_paginas),
          '_soma_text_q': 0.0, '_soma_text_v': 0.0, '_soma_text_n': 0}
-    with pdfplumber.open(caminho) as pdf:
-        d['paginas'] = len(pdf.pages)
-        for i, page in enumerate(pdf.pages):
-            for linha in _grade_produtos(page):
+    colunas_x = None
+    for pos, i in enumerate(indices_paginas):
+        page = pdf.pages[i]
+        if colunas_x is None:
+            colunas_x = _colunas_produtos(page)
+        if colunas_x:
+            for linha in _linhas_produtos(page, colunas_x):
                 if len(linha) < 9:
                     continue
                 cod = (linha[0] or '').strip()
@@ -229,45 +327,66 @@ def ler_danfe(caminho):
                 d['itens'].append({'cod': cod, 'desc': desc,
                                    'unid': (linha[5] or '').strip(),
                                    'qtd': qtd, 'vunit': num(linha[7]), 'vtot': vtot})
-            texto = page.extract_text() or ''
-            sq_txt, sv_txt, n_txt = _somar_produtos_do_texto(texto)
-            d['_soma_text_q'] += sq_txt
-            d['_soma_text_v'] += sv_txt
-            d['_soma_text_n'] += n_txt
-            m = re.search(r'[OQ]TD\.?\s*\n?TOTAL:\s*([\d\.,]+)', texto)
-            if m:
-                d['qtd_total'] = num(m.group(1))
-            if i == 0:
-                pl = page.extract_words()
-                cnpjs = sorted([w for w in pl if w['text'] == 'CNPJ/CPF'], key=lambda w: w['top'])
-                x_cnpj = cnpjs[0]['x0'] - 4 if cnpjs else None
-                d['cliente'] = _campo(page, pl, ['NOME/RAZÃO', 'SOCIAL'], x1=x_cnpj)
-                d['cnpj'] = _campo(page, pl, ['CNPJ/CPF'],
-                                   x1=(cnpjs[0]['x0'] + 120 if cnpjs else None))
-                d['emissao'] = _campo(page, pl, ['DATA', 'DA', 'EMISSÃO'], x1=page.width - 2)
-                rz_a, _ = _seq(pl, ['RAZÃO', 'SOCIAL'])
-                x_frete = None
-                if rz_a:
-                    cands = [w['x0'] for w in pl
-                             if w['text'] == 'FRETE' and abs(w['top'] - rz_a['top']) < 6]
-                    x_frete = min(cands) - 4 if cands else None
-                d['transportadora'] = _campo(page, pl, ['RAZÃO', 'SOCIAL'], x1=x_frete)
-                esp = [w for w in pl if w['text'] == 'ESPÉCIE']
-                d['volumes'] = num(_campo(page, pl, ['QUANTIDADE'],
-                                          x1=(esp[0]['x0'] - 4 if esp else None)))
-                pesos = sorted([w for w in pl if w['text'] == 'PESO'], key=lambda w: w['x0'])
-                x_pl = pesos[1]['x0'] - 4 if len(pesos) > 1 else None
-                d['peso_bruto'] = num(_campo(page, pl, ['PESO', 'BRUTO'], x1=x_pl))
-                d['tot_prod'] = num(_campo(page, pl, ['VALOR', 'TOTAL', 'DOS', 'PRODUTOS'],
-                                           x1=page.width - 2))
-                m = re.search(r'N[ºo]\s*(\d{3}\.\d{3}\.\d{3})', texto)
-                d['nota'] = m.group(1).lstrip('0.') if m else None
-                m = re.search(r'SÉRIE:\s*(\d+)', texto)
-                d['serie'] = m.group(1) if m else None
-                m = re.search(r'CHAVE DE ACESSO\s*\n([\d ]{50,})', texto)
-                d['chave'] = re.sub(r'\D', '', m.group(1)) if m else None
+        texto = page.extract_text() or ''
+        sq_txt, sv_txt, n_txt = _somar_produtos_do_texto(texto)
+        d['_soma_text_q'] += sq_txt
+        d['_soma_text_v'] += sv_txt
+        d['_soma_text_n'] += n_txt
+        m = re.search(r'[OQ]TD\.?\s*\n?TOTAL:\s*([\d\.,]+)', texto)
+        if m:
+            d['qtd_total'] = num(m.group(1))
+        if pos == 0:
+            pl = page.extract_words()
+            cnpjs = sorted([w for w in pl if w['text'] == 'CNPJ/CPF'], key=lambda w: w['top'])
+            x_cnpj = cnpjs[0]['x0'] - 4 if cnpjs else None
+            d['cliente'] = _campo(page, pl, ['NOME/RAZÃO', 'SOCIAL'], x1=x_cnpj)
+            d['cnpj'] = _campo(page, pl, ['CNPJ/CPF'],
+                               x1=(cnpjs[0]['x0'] + 120 if cnpjs else None))
+            d['emissao'] = _campo(page, pl, ['DATA', 'DA', 'EMISSÃO'], x1=page.width - 2)
+            rz_a, _ = _seq(pl, ['RAZÃO', 'SOCIAL'])
+            x_frete = None
+            if rz_a:
+                cands = [w['x0'] for w in pl
+                         if w['text'] == 'FRETE' and abs(w['top'] - rz_a['top']) < 6]
+                x_frete = min(cands) - 4 if cands else None
+            d['transportadora'] = _campo(page, pl, ['RAZÃO', 'SOCIAL'], x1=x_frete)
+            esp = [w for w in pl if w['text'] == 'ESPÉCIE']
+            d['volumes'] = num(_campo(page, pl, ['QUANTIDADE'],
+                                      x1=(esp[0]['x0'] - 4 if esp else None)))
+            pesos = sorted([w for w in pl if w['text'] == 'PESO'], key=lambda w: w['x0'])
+            x_pl = pesos[1]['x0'] - 4 if len(pesos) > 1 else None
+            d['peso_bruto'] = num(_campo(page, pl, ['PESO', 'BRUTO'], x1=x_pl))
+            d['tot_prod'] = num(_campo(page, pl, ['VALOR', 'TOTAL', 'DOS', 'PRODUTOS'],
+                                       x1=page.width - 2))
+            m = re.search(r'N[ºo]\s*(\d{3}\.\d{3}\.\d{3})', texto)
+            d['nota'] = m.group(1).lstrip('0.') if m else None
+            m = re.search(r'SÉRIE:\s*(\d+)', texto)
+            d['serie'] = m.group(1) if m else None
+            m = re.search(r'CHAVE DE ACESSO\s*\n([\d ]{50,})', texto)
+            d['chave'] = re.sub(r'\D', '', m.group(1)) if m else None
     d['status'] = _validar(d)
     return d
+
+
+def ler_danfe(caminho):
+    """Le um PDF de DANFE(s) e devolve uma lista de notas - pode ter mais de uma,
+    quando varias DANFEs vem agrupadas no mesmo arquivo. Nesse caso, cada nota e
+    fatiada num PDF proprio (em SPLIT_DIR) para que impressao/anexo peguem so as
+    paginas daquela NF, e nao o arquivo inteiro."""
+    with pdfplumber.open(caminho) as pdf:
+        grupos = _agrupar_paginas(pdf)
+        notas = [_ler_nota(pdf, grupo, caminho) for grupo in grupos]
+        if len(grupos) > 1:
+            base = os.path.splitext(os.path.basename(caminho))[0]
+            for d in notas:
+                sufixo = f"{d.get('nota') or '?'}_{d.get('serie') or '?'}"
+                destino = os.path.join(SPLIT_DIR, f"{base}__NF{sufixo}.pdf")
+                try:
+                    _fatiar_pdf(caminho, d['paginas_arquivo'], destino)
+                    d['caminho'] = destino
+                except Exception:
+                    pass
+    return notas
 
 
 def _validar(d):
@@ -320,30 +439,47 @@ def varrer_pasta(pasta, log=None):
         st = os.stat(caminho)
         assinatura = f"{PARSER_VERSAO}:{st.st_mtime_ns}:{st.st_size}"
         chave_cache = os.path.abspath(caminho)
-        item = cache.get(chave_cache)
-        if not item or item.get('_assin') != assinatura:
+        notas = cache.get(chave_cache)
+        precisa_reler = (not isinstance(notas, list) or not notas
+                        or notas[0].get('_assin') != assinatura
+                        or any(d.get('caminho') != caminho and not os.path.exists(d.get('caminho') or '')
+                               for d in notas))
+        if precisa_reler:
             if log:
                 log(f"Lendo {os.path.basename(caminho)}...")
             try:
-                item = ler_danfe(caminho)
+                notas = ler_danfe(caminho)
             except Exception as e:
-                item = {'arquivo': os.path.basename(caminho), 'caminho': caminho,
-                        'itens': [], 'status': 'ERRO', 'erro': str(e), 'nota': None,
-                        'serie': None, 'cliente': None, 'emissao': None,
-                        'volumes': None, 'peso_bruto': None, 'chave': None,
-                        'transportadora': None, 'cnpj': None, '_soma_text_q': 0.0,
-                         '_soma_text_v': 0.0, '_soma_text_n': 0}
-            item['_assin'] = assinatura
-        item['caminho'] = caminho
-        cache[chave_cache] = item
-        ch = item.get('chave')
-        if ch and ch in chaves:
-            continue
-        if ch:
-            chaves.add(ch)
+                notas = [{'arquivo': os.path.basename(caminho), 'caminho': caminho,
+                         'itens': [], 'status': 'ERRO', 'erro': str(e), 'nota': None,
+                         'serie': None, 'cliente': None, 'emissao': None,
+                         'volumes': None, 'peso_bruto': None, 'chave': None,
+                         'transportadora': None, 'cnpj': None, '_soma_text_q': 0.0,
+                          '_soma_text_v': 0.0, '_soma_text_n': 0}]
+            for d in notas:
+                d['_assin'] = assinatura
+        for d in notas:
+            d['arquivo_original'] = caminho
+            if len(notas) == 1:
+                d['caminho'] = caminho
+        cache[chave_cache] = notas
         vistos.add(chave_cache)
-        resultado.append(item)
+        for item in notas:
+            ch = item.get('chave')
+            if ch and ch in chaves:
+                continue
+            if ch:
+                chaves.add(ch)
+            resultado.append(item)
     for k in [k for k in cache if k not in vistos]:
+        for d in cache[k] if isinstance(cache[k], list) else []:
+            caminho_dividido = d.get('caminho')
+            if (caminho_dividido and caminho_dividido != k
+                    and os.path.dirname(os.path.abspath(caminho_dividido)) == SPLIT_DIR):
+                try:
+                    os.remove(caminho_dividido)
+                except OSError:
+                    pass
         cache.pop(k, None)
     try:
         with open(CACHE_PATH, 'w', encoding='utf-8') as f:
