@@ -1649,22 +1649,22 @@ class App(tk.Tk):
 
         meio = ttk.Frame(self, padding=(6, 0))
         meio.pack(fill='both', expand=True)
-        cols = ('nota', 'serie', 'cliente', 'emissao', 'itens', 'volumes', 'peso', 'status')
+        cols = ('nota', 'serie', 'cliente', 'cidade', 'emissao', 'itens', 'volumes', 'peso', 'status')
         self.tree = ttk.Treeview(meio, columns=cols, show='tree headings',
                                  selectmode='browse')
         self.tree.heading('#0', text='')
         self.tree.column('#0', width=38, minwidth=38, stretch=False, anchor='center')
         self.tree.configure(style='Rom.Treeview')
         ttk.Style(self).configure('Rom.Treeview', rowheight=22)
-        larguras = {'nota': 70, 'serie': 45, 'cliente': 300, 'emissao': 130,
+        larguras = {'nota': 70, 'serie': 45, 'cliente': 260, 'cidade': 130, 'emissao': 130,
                     'itens': 50, 'volumes': 65, 'peso': 80, 'status': 110}
-        titulos = {'nota': 'Nota', 'serie': 'Serie', 'cliente': 'Cliente',
+        titulos = {'nota': 'Nota', 'serie': 'Serie', 'cliente': 'Cliente', 'cidade': 'Cidade',
                    'emissao': 'Emissao', 'itens': 'Itens', 'volumes': 'Volumes',
                    'peso': 'Peso Bruto', 'status': 'Status'}
         for c in cols:
             self.tree.heading(c, text=titulos[c])
             self.tree.column(c, width=larguras[c],
-                             anchor='center' if c != 'cliente' else 'w')
+                             anchor='w' if c in ('cliente', 'cidade') else 'center')
         self.tree.tag_configure('ruim', background='#ffd6d6')
         self.tree.tag_configure('alerta', background='#fff3cd')
         self.tree.pack(side='left', fill='both', expand=True)
@@ -1781,7 +1781,8 @@ class App(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         visiveis = 0
         for i, d in enumerate(self.notas):
-            alvo = f"{d.get('nota') or ''} {d.get('cliente') or ''} {d.get('arquivo')}".lower()
+            alvo = (f"{d.get('nota') or ''} {d.get('cliente') or ''} "
+                   f"{d.get('cidade') or ''} {d.get('arquivo')}").lower()
             if filtro and filtro not in alvo:
                 continue
             dt = para_data(d.get('emissao'))
@@ -1800,8 +1801,8 @@ class App(tk.Tk):
                              image=(self.img_on if i in self.marcadas else self.img_off),
                              values=(
                 d.get('nota') or '?', d.get('serie') or '-',
-                (d.get('cliente') or '-')[:60], d.get('emissao') or '-',
-                len(d.get('itens') or []),
+                (d.get('cliente') or '-')[:60], d.get('cidade') or '-',
+                d.get('emissao') or '-', len(d.get('itens') or []),
                 fmt(d.get('volumes'), 0), fmt(d.get('peso_bruto'), 3),
                 d.get('status', '?')))
         aviso = ''
