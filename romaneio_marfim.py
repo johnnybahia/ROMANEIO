@@ -42,7 +42,7 @@ CONFIG_PADRAO = {
         "usuario": "",
         "senha": "",
         "remetente": "",
-        "destinatarios": [],
+        "contatos_cnpj": {},
         "assunto": "Romaneio de Expedicao - {romaneio}",
         "corpo": "Segue em anexo o romaneio de expedicao {romaneio}.\n\nNotas: {notas}\nVolumes: {volumes}\n"
     }
@@ -304,8 +304,8 @@ def _ler_nota(pdf, indices_paginas, caminho):
          'arquivo_original': caminho, 'paginas_arquivo': list(indices_paginas),
          'itens': [], 'volumes': None, 'peso_bruto': None, 'tot_prod': None,
          'qtd_total': None, 'nota': None, 'serie': None, 'chave': None,
-         'cliente': None, 'cnpj': None, 'emissao': None, 'transportadora': None,
-         'paginas': len(indices_paginas),
+         'cliente': None, 'cnpj': None, 'cidade': None, 'emissao': None,
+         'transportadora': None, 'paginas': len(indices_paginas),
          '_soma_text_q': 0.0, '_soma_text_v': 0.0, '_soma_text_n': 0}
     colunas_x = None
     for pos, i in enumerate(indices_paginas):
@@ -343,6 +343,13 @@ def _ler_nota(pdf, indices_paginas, caminho):
             d['cnpj'] = _campo(page, pl, ['CNPJ/CPF'],
                                x1=(cnpjs[0]['x0'] + 120 if cnpjs else None))
             d['emissao'] = _campo(page, pl, ['DATA', 'DA', 'EMISSÃO'], x1=page.width - 2)
+            mun_a, _ = _seq(pl, ['MUNICÍPIO'])
+            x_fone = None
+            if mun_a:
+                cands = [w['x0'] for w in pl
+                         if w['text'] == 'FONE/FAX' and abs(w['top'] - mun_a['top']) < 3]
+                x_fone = min(cands) - 4 if cands else None
+            d['cidade'] = _campo(page, pl, ['MUNICÍPIO'], x1=x_fone)
             rz_a, _ = _seq(pl, ['RAZÃO', 'SOCIAL'])
             x_frete = None
             if rz_a:
@@ -368,19 +375,29 @@ def _ler_nota(pdf, indices_paginas, caminho):
     return d
 
 
+_RX_NOME_INVALIDO = re.compile(r'[<>:"/\\|?*]')
+
+
+def _nome_arquivo_nota(d):
+    primeiro_nome = (d.get('cliente') or '').split()[0] if d.get('cliente') else ''
+    partes = [f"NF{d.get('nota') or '?'}", primeiro_nome, (d.get('cidade') or '').strip()]
+    nome = '_'.join(p for p in partes if p)
+    return re.sub(r'\s+', '-', _RX_NOME_INVALIDO.sub('', nome))
+
+
 def ler_danfe(caminho):
     """Le um PDF de DANFE(s) e devolve uma lista de notas - pode ter mais de uma,
     quando varias DANFEs vem agrupadas no mesmo arquivo. Nesse caso, cada nota e
-    fatiada num PDF proprio (em SPLIT_DIR) para que impressao/anexo peguem so as
-    paginas daquela NF, e nao o arquivo inteiro."""
+    fatiada num PDF proprio (em SPLIT_DIR, nomeado com numero, cliente e cidade)
+    para que impressao/anexo peguem so as paginas daquela NF, e nao o arquivo
+    inteiro."""
     with pdfplumber.open(caminho) as pdf:
         grupos = _agrupar_paginas(pdf)
         notas = [_ler_nota(pdf, grupo, caminho) for grupo in grupos]
         if len(grupos) > 1:
             base = os.path.splitext(os.path.basename(caminho))[0]
             for d in notas:
-                sufixo = f"{d.get('nota') or '?'}_{d.get('serie') or '?'}"
-                destino = os.path.join(SPLIT_DIR, f"{base}__NF{sufixo}.pdf")
+                destino = os.path.join(SPLIT_DIR, f"{base}__{_nome_arquivo_nota(d)}.pdf")
                 try:
                     _fatiar_pdf(caminho, d['paginas_arquivo'], destino)
                     d['caminho'] = destino
@@ -677,6 +694,31 @@ def _contexto(notas, numero):
             'volumes': fmt(sum((d.get('volumes') or 0) for d in notas), 0)}
 
 
+def cnpj_normalizado(s):
+    return re.sub(r'\D', '', s or '')
+
+
+def destinatarios_por_cnpj(notas, cfg):
+    """Junta os e-mails cadastrados para os CNPJs das notas informadas.
+
+    Devolve (destinatarios, faltando): destinatarios e a lista de e-mails (sem
+    repetir), faltando e a lista de notas cujo CNPJ nao tem e-mail cadastrado em
+    Configuracoes > Destinatarios por CNPJ.
+    """
+    contatos = cfg.get('email', {}).get('contatos_cnpj', {})
+    destinatarios, faltando = [], []
+    for d in notas:
+        chave = cnpj_normalizado(d.get('cnpj'))
+        emails = contatos.get(chave, {}).get('emails') or []
+        if not emails:
+            faltando.append(d)
+            continue
+        for email in emails:
+            if email not in destinatarios:
+                destinatarios.append(email)
+    return destinatarios, faltando
+
+
 def localizar_thunderbird(cfg=None):
     if cfg and cfg.get('thunderbird') and os.path.exists(cfg['thunderbird']):
         return cfg['thunderbird']
@@ -709,17 +751,16 @@ def _limpar_campo(txt):
     return str(txt).replace(',', ';').replace("'", '')
 
 
-def enviar_por_thunderbird(pdf, notas, numero, cfg):
+def enviar_por_thunderbird(pdf, notas, numero, cfg, destinatarios):
     exe = localizar_thunderbird(cfg)
     if not exe:
         raise RuntimeError('Thunderbird nao encontrado. Informe o caminho do thunderbird.exe '
                            'em Configuracoes > Conta de envio.')
+    if not destinatarios:
+        raise RuntimeError('Nenhum destinatario cadastrado para os CNPJs deste romaneio.')
     e = cfg['email']
-    dest = e.get('destinatarios') or []
-    if not dest:
-        raise RuntimeError('Nenhum destinatario cadastrado.')
     ctx = _contexto(notas, numero)
-    campos = [f"to='{';'.join(dest)}'",
+    campos = [f"to='{';'.join(destinatarios)}'",
               f"subject='{_limpar_campo(e['assunto'].format(**ctx))}'",
               f"body='{_limpar_campo(e['corpo'].format(**ctx))}'",
               f"attachment='{os.path.abspath(pdf)}'"]
@@ -727,19 +768,19 @@ def enviar_por_thunderbird(pdf, notas, numero, cfg):
     return 'thunderbird'
 
 
-def enviar_por_smtp(pdf, notas, numero, cfg):
+def enviar_por_smtp(pdf, notas, numero, cfg, destinatarios):
     e = cfg['email']
-    
+
     if not e.get('smtp'):
         raise RuntimeError('Servidor SMTP nao configurado.\nVa em Configuracoes > Conta de envio e preencha os dados.')
-        
-    if not e.get('destinatarios'):
-        raise RuntimeError('Nenhum destinatario cadastrado.')
+
+    if not destinatarios:
+        raise RuntimeError('Nenhum destinatario cadastrado para os CNPJs deste romaneio.')
     ctx = _contexto(notas, numero)
     msg = EmailMessage()
     msg['Subject'] = e['assunto'].format(**ctx)
     msg['From'] = e.get('remetente') or e.get('usuario')
-    msg['To'] = ', '.join(e['destinatarios'])
+    msg['To'] = ', '.join(destinatarios)
     msg.set_content(e['corpo'].format(**ctx))
     with open(pdf, 'rb') as f:
         msg.add_attachment(f.read(), maintype='application', subtype='pdf',
@@ -768,11 +809,11 @@ def enviar_por_smtp(pdf, notas, numero, cfg):
     return 'smtp'
 
 
-def enviar_email(pdf, notas, numero, cfg):
+def enviar_email(pdf, notas, numero, cfg, destinatarios):
     modo = (cfg.get('email', {}).get('modo_envio') or 'smtp').lower()
     if modo == 'thunderbird':
-        return enviar_por_thunderbird(pdf, notas, numero, cfg)
-    return enviar_por_smtp(pdf, notas, numero, cfg)
+        return enviar_por_thunderbird(pdf, notas, numero, cfg, destinatarios)
+    return enviar_por_smtp(pdf, notas, numero, cfg, destinatarios)
 
 
 def listar_impressoras():
@@ -1048,13 +1089,18 @@ class JanelaRevisao(tk.Toplevel):
                       text='Atencao: nota(s) sem volumes informados - '
                            + ', '.join(str(d.get('nota')) for d in sem_vol)).pack(anchor='w')
 
-        dest = self.pai.cfg['email'].get('destinatarios', [])
+        dest, faltando = destinatarios_por_cnpj(self.notas, self.pai.cfg)
         ttk.Separator(f, orient='horizontal').pack(fill='x', pady=8)
-        ttk.Label(f, text='Sera enviado para:', font=('Segoe UI', 9, 'bold')).pack(anchor='w')
-        ttk.Label(f, text=(', '.join(dest) if dest else
-                           'Nenhum destinatario cadastrado - abra Configuracoes > Destinatarios.'),
+        ttk.Label(f, text='Sera enviado para (por CNPJ da nota):',
+                  font=('Segoe UI', 9, 'bold')).pack(anchor='w')
+        ttk.Label(f, text=(', '.join(dest) if dest else 'Nenhum e-mail cadastrado.'),
                   foreground=('#205020' if dest else '#a02020'),
                   wraplength=820).pack(anchor='w')
+        if faltando:
+            ttk.Label(f, foreground='#a02020', wraplength=820,
+                      text='CNPJ sem e-mail cadastrado (Configuracoes > Destinatarios por CNPJ) - '
+                           + ', '.join(f"NF {d.get('nota')} ({d.get('cliente') or d.get('cnpj') or '?'})"
+                                      for d in faltando)).pack(anchor='w')
 
     # ------------------------------------------------------------ aba previa
     def _aba_previa(self, nb):
@@ -1123,10 +1169,18 @@ class JanelaRevisao(tk.Toplevel):
 
     # ------------------------------------------------------------ envio
     def enviar(self):
-        dest = self.pai.cfg['email'].get('destinatarios', [])
+        dest, faltando = destinatarios_por_cnpj(self.notas, self.pai.cfg)
+        if faltando:
+            messagebox.showerror(
+                'E-mail nao cadastrado',
+                'Estas notas tem CNPJ sem e-mail cadastrado. Cadastre em '
+                'Configuracoes > Destinatarios por CNPJ antes de enviar:\n\n'
+                + '\n'.join(f"NF {d.get('nota')} - {d.get('cliente') or '?'} "
+                           f"(CNPJ {d.get('cnpj') or '?'})" for d in faltando), parent=self)
+            return
         if not dest:
             messagebox.showwarning('E-mail', 'Nenhum destinatario cadastrado.\n'
-                                             'Abra Configuracoes > Destinatarios.', parent=self)
+                                             'Abra Configuracoes > Destinatarios por CNPJ.', parent=self)
             return
         vol = fmt(sum((d.get('volumes') or 0) for d in self.notas), 0)
         lista = ', '.join(str(d.get('nota') or '?') for d in self.notas)
@@ -1145,7 +1199,7 @@ class JanelaRevisao(tk.Toplevel):
 
         def tarefa():
             try:
-                usado = enviar_email(self.pdf, self.notas, self.numero, self.pai.cfg)
+                usado = enviar_email(self.pdf, self.notas, self.numero, self.pai.cfg, dest)
                 if usado == 'thunderbird':
                     self.pai.after(0, lambda: self.pai.var_status.set(
                         'Mensagem aberta no Thunderbird - clique em Enviar por la.'))
@@ -1201,7 +1255,7 @@ class JanelaConfig(tk.Toplevel):
         nb = ttk.Notebook(self)
         nb.pack(fill='both', expand=True, padx=8, pady=8)
         self._aba_conta(nb)
-        self._aba_destinatarios(nb)
+        self._aba_contatos_cnpj(nb)
         self._aba_impressao(nb)
 
     # ---------------------------------------------------------------- abas
@@ -1299,30 +1353,88 @@ class JanelaConfig(tk.Toplevel):
         if p:
             self.var_tb.set(p)
 
-    def _aba_destinatarios(self, nb):
+    def _aba_contatos_cnpj(self, nb):
         f = ttk.Frame(nb, padding=10)
-        nb.add(f, text='Destinatarios')
-        ttk.Label(f, text='E-mails que recebem o romaneio:').pack(anchor='w')
+        nb.add(f, text='Destinatarios por CNPJ')
+        ttk.Label(f, text='Cada CNPJ de cliente recebe o romaneio nos e-mails cadastrados '
+                          'abaixo. Notas com CNPJ sem cadastro bloqueiam a geracao.',
+                  wraplength=430).pack(anchor='w', pady=(0, 6))
         cx = ttk.Frame(f)
         cx.pack(fill='both', expand=True, pady=4)
-        self.lst = tk.Listbox(cx, height=12)
-        self.lst.pack(side='left', fill='both', expand=True)
-        sb = ttk.Scrollbar(cx, orient='vertical', command=self.lst.yview)
+        cols = ('cnpj', 'emails')
+        self.tv_contatos = ttk.Treeview(cx, columns=cols, show='headings', height=12)
+        self.tv_contatos.heading('cnpj', text='CNPJ')
+        self.tv_contatos.heading('emails', text='E-mails')
+        self.tv_contatos.column('cnpj', width=140, anchor='w')
+        self.tv_contatos.column('emails', width=290, anchor='w')
+        self.tv_contatos.pack(side='left', fill='both', expand=True)
+        sb = ttk.Scrollbar(cx, orient='vertical', command=self.tv_contatos.yview)
         sb.pack(side='right', fill='y')
-        self.lst.configure(yscrollcommand=sb.set)
-        for d in self.cfg['email'].get('destinatarios', []):
-            self.lst.insert('end', d)
+        self.tv_contatos.configure(yscrollcommand=sb.set)
+        self.tv_contatos.bind('<Double-1>', self.editar_contato_cnpj)
+        self._preencher_contatos_cnpj()
+
         ln = ttk.Frame(f)
         ln.pack(fill='x', pady=4)
-        self.var_novo = tk.StringVar()
-        ent = ttk.Entry(ln, textvariable=self.var_novo, width=40)
-        ent.pack(side='left')
-        ent.bind('<Return>', lambda ev: self.add_email())
-        ttk.Button(ln, text='Adicionar', command=self.add_email).pack(side='left', padx=4)
-        ttk.Button(ln, text='Remover', command=self.rem_email).pack(side='left')
-        self.lst.bind('<Double-1>', self.edit_email)
-        ttk.Label(f, text='Duplo clique edita. Enter adiciona.',
-                  foreground='#555').pack(anchor='w')
+        ttk.Button(ln, text='Adicionar', command=self.add_contato_cnpj).pack(side='left', padx=(0, 4))
+        ttk.Button(ln, text='Remover', command=self.rem_contato_cnpj).pack(side='left')
+        ttk.Label(f, text='Duplo clique edita.', foreground='#555').pack(anchor='w')
+
+    def _preencher_contatos_cnpj(self):
+        self.tv_contatos.delete(*self.tv_contatos.get_children())
+        for chave, c in self.cfg['email'].get('contatos_cnpj', {}).items():
+            self.tv_contatos.insert('', 'end', iid=chave,
+                                    values=(c.get('cnpj_fmt') or chave, ', '.join(c.get('emails') or [])))
+
+    def _pedir_contato_cnpj(self, cnpj_inicial='', emails_inicial=''):
+        cnpj = simpledialog.askstring('CNPJ', 'CNPJ do cliente:', initialvalue=cnpj_inicial, parent=self)
+        if cnpj is None:
+            return None
+        chave = cnpj_normalizado(cnpj)
+        if not chave:
+            messagebox.showwarning('CNPJ', 'CNPJ invalido.', parent=self)
+            return None
+        emails_txt = simpledialog.askstring(
+            'E-mails', f'E-mails para o CNPJ {cnpj} (separe por virgula):',
+            initialvalue=emails_inicial, parent=self)
+        if emails_txt is None:
+            return None
+        emails = [e.strip() for e in re.split('[,;]', emails_txt) if e.strip()]
+        invalidos = [e for e in emails if '@' not in e or '.' not in e.split('@')[-1]]
+        if invalidos:
+            messagebox.showwarning('E-mails', f'Endereco(s) invalido(s): {", ".join(invalidos)}',
+                                   parent=self)
+            return None
+        return chave, {'cnpj_fmt': cnpj.strip(), 'emails': emails}
+
+    def add_contato_cnpj(self):
+        resultado = self._pedir_contato_cnpj()
+        if not resultado:
+            return
+        chave, contato = resultado
+        self.cfg['email'].setdefault('contatos_cnpj', {})[chave] = contato
+        self._preencher_contatos_cnpj()
+
+    def editar_contato_cnpj(self, _ev=None):
+        sel = self.tv_contatos.selection()
+        if not sel:
+            return
+        chave_atual = sel[0]
+        atual = self.cfg['email']['contatos_cnpj'][chave_atual]
+        resultado = self._pedir_contato_cnpj(atual.get('cnpj_fmt', chave_atual),
+                                             ', '.join(atual.get('emails') or []))
+        if not resultado:
+            return
+        chave_nova, contato = resultado
+        if chave_nova != chave_atual:
+            self.cfg['email']['contatos_cnpj'].pop(chave_atual, None)
+        self.cfg['email']['contatos_cnpj'][chave_nova] = contato
+        self._preencher_contatos_cnpj()
+
+    def rem_contato_cnpj(self):
+        for chave in self.tv_contatos.selection():
+            self.cfg['email']['contatos_cnpj'].pop(chave, None)
+        self._preencher_contatos_cnpj()
 
     def _aba_impressao(self, nb):
         f = ttk.Frame(nb, padding=10)
@@ -1371,33 +1483,6 @@ class JanelaConfig(tk.Toplevel):
         if p:
             var.set(p)
 
-    def add_email(self):
-        v = self.var_novo.get().strip()
-        if not v:
-            return
-        if '@' not in v or '.' not in v.split('@')[-1]:
-            messagebox.showwarning('E-mail', 'Endereco invalido.', parent=self)
-            return
-        if v in self.lst.get(0, 'end'):
-            messagebox.showinfo('E-mail', 'Ja cadastrado.', parent=self)
-            return
-        self.lst.insert('end', v)
-        self.var_novo.set('')
-
-    def rem_email(self):
-        for i in reversed(self.lst.curselection()):
-            self.lst.delete(i)
-
-    def edit_email(self, _ev=None):
-        sel = self.lst.curselection()
-        if not sel:
-            return
-        atual = self.lst.get(sel[0])
-        novo = simpledialog.askstring('Editar', 'E-mail:', initialvalue=atual, parent=self)
-        if novo:
-            self.lst.delete(sel[0])
-            self.lst.insert(sel[0], novo.strip())
-
     def _coletar(self):
         c = self.cfg
         c['impressora'] = self.var_impressora.get().strip()
@@ -1416,7 +1501,6 @@ class JanelaConfig(tk.Toplevel):
         except ValueError:
             e['porta'] = 587
         e['corpo'] = self.txt_corpo.get('1.0', 'end').rstrip('\n')
-        e['destinatarios'] = list(self.lst.get(0, 'end'))
         return c
 
     def testar(self):
@@ -1790,6 +1874,28 @@ class App(tk.Tk):
                 'Conferencia bloqueada',
                 'Estas notas nao passaram na conferencia e nao podem entrar no romaneio:\n\n'
                 + '\n'.join(f"{d.get('nota') or d['arquivo']} - {d['status']}" for d in ruins))
+            return
+        cnpjs = {}
+        for d in sel:
+            cnpjs.setdefault(cnpj_normalizado(d.get('cnpj')), []).append(d)
+        if len(cnpjs) > 1:
+            linhas = (f"- {grupo[0].get('cliente') or '?'} (CNPJ {grupo[0].get('cnpj') or '?'}) "
+                     f"- {len(grupo)} nota(s)" for grupo in cnpjs.values())
+            if not messagebox.askyesno(
+                    'Clientes diferentes neste romaneio',
+                    'Este romaneio tem notas de mais de um cliente/CNPJ:\n\n'
+                    + '\n'.join(linhas)
+                    + '\n\nConfirma gerar mesmo assim? O e-mail sera enviado para os '
+                      'enderecos cadastrados de TODOS os CNPJs acima.'):
+                return
+        _, faltando = destinatarios_por_cnpj(sel, self.cfg)
+        if faltando:
+            messagebox.showerror(
+                'E-mail nao cadastrado',
+                'Estas notas tem CNPJ sem e-mail cadastrado. Cadastre em '
+                'Configuracoes > Destinatarios por CNPJ antes de gerar:\n\n'
+                + '\n'.join(f"NF {d.get('nota')} - {d.get('cliente') or '?'} "
+                           f"(CNPJ {d.get('cnpj') or '?'})" for d in faltando))
             return
         visiveis = {int(x) for x in self.tree.get_children()}
         escondidas = [self.notas[i] for i in sorted(self.marcadas) if i not in visiveis]
